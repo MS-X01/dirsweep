@@ -1,0 +1,932 @@
+#!/usr/bin/env bash
+#
+# dirsweep - remove empty and junk-only directories, with an undo.
+#
+# Author:  Mohammad Sadra Naderi (ZVitoX) <https://github.com/MS-X01>
+# License: MIT
+#
+set -uo pipefail
+
+readonly VERSION="4.0.0"
+readonly PROG="dirsweep"
+
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+    printf '%s: bash 4.4 or newer is required (this is %s)\n' "$PROG" "$BASH_VERSION" >&2
+    exit 2
+fi
+
+# ------------------------------------------------------------------ defaults
+
+CLI_ROOTS=() CFG_ROOTS=()
+EXCLUDES=()
+JUNK_EXTRA=()
+USE_DEFAULT_JUNK=true
+MAX_DEPTH=0
+MIN_AGE_SECS=0
+STRICT=false DRY_RUN=false INTERACTIVE=false ASSUME_YES=false
+VERBOSE=false QUIET=false CROSS_FS=false FOLLOW_LINKS=false PROGRESS=false
+COLOR=true
+TRASH=false TRASH_DIR=""
+LOG_FILE="" LOG_EXPLICIT=false
+JSON_OUT=""
+CONFIG_FILE="" USE_CONFIG=true
+RESTORE_FROM="" DO_UNDO=false LIST_JUNK=false
+BANNER_MODE=auto SHOW_BANNER_ONLY=false     # auto: only on a terminal
+SETTING_SRC=cli
+
+if (( EUID == 0 )); then
+    DEF_LOG="/var/log/dirsweep.log"
+    DEF_TRASH_ROOT="/var/lib/dirsweep/trash"
+    LOCK_FILE="/run/dirsweep.lock"
+else
+    DEF_LOG="${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/dirsweep/dirsweep.log"
+    DEF_TRASH_ROOT="${XDG_DATA_HOME:-${HOME:-/tmp}/.local/share}/dirsweep/trash"
+    LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/dirsweep-$EUID.lock"
+fi
+
+# Roots we refuse outright, and trees we refuse to touch anything inside.
+DANGEROUS_EXACT=(/ /home /root /run /var /usr)
+DANGEROUS_TREES=(/bin /sbin /lib /lib32 /lib64 /libx32 /boot /dev /proc /sys /etc
+                 /usr/bin /usr/sbin /usr/lib /usr/lib32 /usr/lib64 /usr/libx32
+                 /usr/libexec /usr/share /usr/include)
+
+# Only regular files and symlinks matching these count as junk. Patterns that
+# are risky for a "delete when nothing else is here" rule (*.lock, *.pid,
+# core, ...) are deliberately not in the list; add them with -j if you want.
+JUNK_DEFAULT=(
+    ".DS_Store" "._*"
+    "Thumbs.db" "ehthumbs.db" "ehthumbs_vista.db" "desktop.ini"
+    "*.swp" "*.swo" "*.swn" "#*#" ".#*" "*~" "*.orig" "*.rej"
+    "*.log" "*.tmp" "*.temp" "*.bak"
+    "*.pyc" "*.pyo" "nohup.out"
+)
+ALL_JUNK=()
+
+# ------------------------------------------------------------------- state
+
+CHECKED=0 REMOVED=0 JUNK_N=0 KEPT=0 SKIPPED=0 ERRORS=0
+declare -A SKIP_WHY=()
+declare -A GONE=()          # dry-run: paths that would already be gone
+declare -A MADE=()          # restore: directories we created
+TMP_DIR="" HAVE_LOCK=false FINISHED=false QUIT=false ALL_YES=false
+PROGRESS_ON=false LAST_PCT=-1 NOW=0
+ROOTS=()
+ENTRIES=() JUNK_FILES=() CLASS=""
+NORM=()
+C_RED='' C_GRN='' C_YEL='' C_BLU='' C_CYN='' C_BLD='' C_DIM='' C_RST='' C_ACC=''
+E_RED='' E_YEL='' E_RST=''
+GRADIENT=()
+
+# ------------------------------------------------------------------ output
+
+setup_colors() {
+    C_RED='' C_GRN='' C_YEL='' C_BLU='' C_CYN='' C_BLD='' C_DIM='' C_RST='' C_ACC=''
+    E_RED='' E_YEL='' E_RST=''
+    GRADIENT=()
+    $COLOR || return 0
+    [[ -n ${NO_COLOR:-} || ${TERM:-} == dumb ]] && return 0
+    if [[ -t 1 ]]; then
+        C_RED=$'\e[31m' C_GRN=$'\e[32m' C_YEL=$'\e[33m' C_BLU=$'\e[34m'
+        C_CYN=$'\e[36m' C_BLD=$'\e[1m' C_DIM=$'\e[2m' C_RST=$'\e[0m'
+        if [[ ${TERM:-} == *256color* || -n ${COLORTERM:-} ]]; then
+            C_ACC=$'\e[38;5;208m'      # orange, the tool's accent colour
+            local c
+            for c in 202 208 208 214 220 221; do GRADIENT+=($'\e[38;5;'"$c"m); done
+        else
+            C_ACC=$'\e[33m'
+        fi
+    fi
+    if [[ -t 2 ]]; then
+        E_RED=$'\e[31m' E_YEL=$'\e[33m' E_RST=$'\e[0m'
+    fi
+}
+
+_clearline() { $PROGRESS_ON && printf '\r\033[K' >&2; return 0; }
+say()  { $QUIET && return 0; _clearline; printf '%s\n' "$*"; }
+info() { $QUIET && return 0; _clearline; printf '%s•%s %s\n' "$C_BLU" "$C_RST" "$*"; }
+ok()   { $QUIET && return 0; _clearline; printf '%s✓%s %s\n' "$C_GRN" "$C_RST" "$*"; }
+vmsg() { $VERBOSE && ! $QUIET && { _clearline; printf '%s  %s%s\n' "$C_DIM" "$*" "$C_RST"; }; return 0; }
+warn() { _clearline; printf '%s!%s %s\n' "$E_YEL" "$E_RST" "$*" >&2; }
+err()  { _clearline; printf '%s✗%s %s\n' "$E_RED" "$E_RST" "$*" >&2; }
+die()  { err "$1"; exit "${2:-1}"; }
+
+log() {
+    [[ -n $LOG_FILE ]] || return 0
+    local ts; printf -v ts '%(%Y-%m-%d %H:%M:%S)T' -1
+    printf '%s [%s] [%d] %s\n' "$ts" "$1" "$$" "$2" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+BANNER_ART=$(cat <<'ART'
+       ___                                  
+  ____/ (_)__________      _____  ___  ____ 
+ / __  / / ___/ ___/ | /| / / _ \/ _ \/ __ \
+/ /_/ / / /  (__  )| |/ |/ /  __/  __/ /_/ /
+\__,_/_/_/  /____/ |__/|__/\___/\___/ .___/ 
+                                   /_/      
+ART
+)
+
+print_banner() {
+    local line i=0 col
+    while IFS= read -r line; do
+        col=${GRADIENT[i]:-$C_ACC}
+        printf '%s%s%s\n' "$col" "$line" "$C_RST"
+        i=$((i + 1))
+    done <<<"$BANNER_ART"
+    printf '%s  empty and junk-only directory cleaner  ·  v%s%s\n\n' "$C_DIM" "$VERSION" "$C_RST"
+}
+
+banner_wanted() {
+    case $BANNER_MODE in
+        on)  return 0 ;;
+        off) return 1 ;;
+        *)   [[ -t 1 ]] && ! $QUIET ;;
+    esac
+}
+
+# ------------------------------------------------------------------- utils
+
+trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; s=${s%"${s##*[![:space:]]}"}; printf '%s' "$s"; }
+
+to_bool() {
+    case ${1,,} in
+        1|true|yes|on)  printf true ;;
+        0|false|no|off) printf false ;;
+        *) return 1 ;;
+    esac
+}
+
+parse_age() {
+    local v=$1 n u
+    [[ $v =~ ^([0-9]+)([smhdw]?)$ ]] || return 1
+    n=$((10#${BASH_REMATCH[1]})) u=${BASH_REMATCH[2]:-d}
+    case $u in
+        s) MIN_AGE_SECS=$n ;;
+        m) MIN_AGE_SECS=$((n * 60)) ;;
+        h) MIN_AGE_SECS=$((n * 3600)) ;;
+        d) MIN_AGE_SECS=$((n * 86400)) ;;
+        w) MIN_AGE_SECS=$((n * 604800)) ;;
+    esac
+}
+
+json_escape() {
+    local s=$1
+    s=${s//\\/\\\\}; s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}; s=${s//$'\t'/\\t}
+    REPLY=$s
+}
+
+json_array() {
+    local out="[" first=true x
+    for x in "$@"; do
+        $first || out+=","
+        first=false
+        json_escape "$x"; out+="\"$REPLY\""
+    done
+    printf '%s]' "$out"
+}
+
+abspath() { realpath -m -- "$1" 2>/dev/null || printf '%s' "$1"; }
+
+# Split a comma-separated CLI value into the named array.
+add_list() {
+    local -n _target=$1; local part
+    local -a parts
+    IFS=',' read -ra parts <<<"$2"
+    for part in "${parts[@]}"; do
+        part=$(trim "$part")
+        [[ -n $part ]] && _target+=("$part")
+    done
+    return 0
+}
+
+# ------------------------------------------------------------ config / args
+
+apply_setting() {
+    local key=$1 val=$2 b
+    case $key in
+        path)       if [[ $SETTING_SRC == cfg ]]; then CFG_ROOTS+=("$val"); else CLI_ROOTS+=("$val"); fi ;;
+        exclude)    add_list EXCLUDES "$val" ;;
+        junk)       add_list JUNK_EXTRA "$val" ;;
+        max_depth)  [[ $val =~ ^[0-9]+$ ]] || return 1; MAX_DEPTH=$((10#$val)) ;;
+        min_age)    parse_age "$val" || return 1 ;;
+        log)        LOG_FILE=$val; LOG_EXPLICIT=true ;;
+        json)       JSON_OUT=$val ;;
+        trash_dir)  TRASH=true; TRASH_DIR=$val ;;
+        banner)     b=$(to_bool "$val") || return 1; if [[ $b == true ]]; then BANNER_MODE=on; else BANNER_MODE=off; fi ;;
+        default_junk) b=$(to_bool "$val") || return 1; USE_DEFAULT_JUNK=$b ;;
+        strict|dry_run|cross_fs|follow_symlinks|trash|quiet|verbose|yes|progress)
+            b=$(to_bool "$val") || return 1
+            case $key in
+                strict) STRICT=$b ;;          dry_run) DRY_RUN=$b ;;
+                cross_fs) CROSS_FS=$b ;;      follow_symlinks) FOLLOW_LINKS=$b ;;
+                trash) TRASH=$b ;;            quiet) QUIET=$b ;;
+                verbose) VERBOSE=$b ;;        yes) ASSUME_YES=$b ;;
+                progress) PROGRESS=$b ;;
+            esac ;;
+        *) return 1 ;;
+    esac
+}
+
+# Plain "key = value" lines. Never sourced, so a config file cannot run code.
+load_config() {
+    local file=$1 line key val n=0
+    [[ -r $file ]] || die "config file not readable: $file" 2
+    SETTING_SRC=cfg
+    while IFS= read -r line || [[ -n $line ]]; do
+        n=$((n + 1))
+        line=$(trim "$line")
+        [[ -z $line || $line == \#* ]] && continue
+        [[ $line == *=* ]] || die "$file:$n: expected 'key = value'" 2
+        key=$(trim "${line%%=*}"); val=$(trim "${line#*=}")
+        if [[ $val == \"*\" || $val == \'*\' ]]; then val=${val:1:${#val}-2}; fi
+        [[ $val == "~"* ]] && val="${HOME:-}${val:1}"
+        apply_setting "${key,,}" "$val" || die "$file:$n: unknown or invalid setting '$key'" 2
+    done <"$file"
+    SETTING_SRC=cli
+}
+
+normalize_args() {
+    NORM=()
+    local a rest i
+    while (( $# )); do
+        a=$1; shift
+        case $a in
+            --)    NORM+=(-- "$@"); break ;;
+            --*=*) NORM+=("${a%%=*}" "${a#*=}") ;;
+            -[!-]?*)
+                rest=${a#-}
+                if [[ $rest =~ ^[nsdiyvqxft]+$ ]]; then
+                    for (( i = 0; i < ${#rest}; i++ )); do NORM+=("-${rest:i:1}"); done
+                else
+                    NORM+=("$a")
+                fi ;;
+            *) NORM+=("$a") ;;
+        esac
+    done
+}
+
+prescan_args() {
+    local i
+    for (( i = 0; i < ${#NORM[@]}; i++ )); do
+        case ${NORM[i]} in
+            --)         break ;;
+            --no-color) COLOR=false ;;
+            --no-config) USE_CONFIG=false ;;
+            -C|--config) CONFIG_FILE=${NORM[i+1]:-} ;;
+        esac
+    done
+}
+
+need_arg() { (( $# >= 2 )) || die "option '$1' needs an argument" 2; }
+
+parse_args() {
+    while (( $# )); do
+        case $1 in
+            -h|--help)    show_help; exit 0 ;;
+            -V|--version) printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+            -p|--path)    need_arg "$@"; CLI_ROOTS+=("$2"); shift 2 ;;
+            -n|--no-subdirs) MAX_DEPTH=1; shift ;;
+            -m|--max-depth)
+                need_arg "$@"
+                [[ $2 =~ ^[0-9]+$ ]] || die "--max-depth needs a non-negative integer" 2
+                MAX_DEPTH=$((10#$2)); shift 2 ;;
+            -s|--strict|--strict-empty) STRICT=true; shift ;;
+            -e|--exclude|--exceptions)  need_arg "$@"; add_list EXCLUDES "$2"; shift 2 ;;
+            -j|--junk|--junk-patterns)  need_arg "$@"; add_list JUNK_EXTRA "$2"; shift 2 ;;
+            --no-default-junk) USE_DEFAULT_JUNK=false; shift ;;
+            --list-junk)  LIST_JUNK=true; shift ;;
+            --min-age)    need_arg "$@"; parse_age "$2" || die "bad --min-age '$2' (try 30, 12h, 2w)" 2; shift 2 ;;
+            -x|--cross-filesystems) CROSS_FS=true; shift ;;
+            -f|--follow-symlinks)   FOLLOW_LINKS=true; shift ;;
+            -d|--dry-run)     DRY_RUN=true; shift ;;
+            -i|--interactive) INTERACTIVE=true; shift ;;
+            -y|--yes)         ASSUME_YES=true; shift ;;
+            -t|--trash)       TRASH=true; shift ;;
+            -T|--trash-dir)   need_arg "$@"; TRASH=true; TRASH_DIR=$2; shift 2 ;;
+            --restore)        need_arg "$@"; RESTORE_FROM=$2; shift 2 ;;
+            --undo)           DO_UNDO=true; shift ;;
+            -v|--verbose)     VERBOSE=true; shift ;;
+            -q|--quiet)       QUIET=true; shift ;;
+            --progress)       PROGRESS=true; shift ;;
+            --banner)         SHOW_BANNER_ONLY=true; shift ;;
+            --no-banner)      BANNER_MODE=off; shift ;;
+            --no-color|--no-config) shift ;;
+            --json)           need_arg "$@"; JSON_OUT=$2; shift 2 ;;
+            -l|--log)         need_arg "$@"; LOG_FILE=$2; LOG_EXPLICIT=true; shift 2 ;;
+            -C|--config)      need_arg "$@"; shift 2 ;;
+            --)               shift; CLI_ROOTS+=("$@"); break ;;
+            -*)               die "unknown option: $1 (see --help)" 2 ;;
+            *)                CLI_ROOTS+=("$1"); shift ;;
+        esac
+    done
+}
+
+show_help() {
+    print_banner
+    cat <<EOF
+${C_BLD}$PROG $VERSION${C_RST} - remove empty and junk-only directories, with an undo.
+
+${C_ACC}${C_BLD}Usage${C_RST}
+  $PROG [options] [PATH...]
+  $PROG --undo
+  $PROG --restore SESSION
+
+${C_ACC}${C_BLD}Selection${C_RST}
+  -p, --path PATH           directory to clean (repeatable, or pass PATHs)
+  -n, --no-subdirs          only look at direct children of PATH
+  -m, --max-depth N         look at most N levels deep (0 = unlimited)
+  -s, --strict-empty        remove only directories that are really empty
+  -e, --exclude REGEX       skip matching paths and everything below them
+                            (repeatable, or comma-separated)
+  -j, --junk GLOB           extra junk file pattern (repeatable, or comma list)
+      --no-default-junk     use only the patterns given with -j
+      --list-junk           show the junk patterns in effect and exit
+      --min-age AGE         only touch directories unchanged for AGE
+                            (30 = days; 12h, 90m, 2w also work)
+  -x, --cross-filesystems   descend into other filesystems
+  -f, --follow-symlinks     traverse symlinked directories
+
+${C_ACC}${C_BLD}Safety${C_RST}
+  -d, --dry-run             show what would happen, change nothing
+  -i, --interactive         ask before each removal (y/N/a=all/q=quit)
+  -y, --yes                 do not ask for the global confirmation
+  -t, --trash               record everything so it can be undone
+  -T, --trash-dir DIR       like --trash, but keep the record in DIR
+      --undo                undo the most recent --trash run
+      --restore SESSION     undo a specific trash session
+
+${C_ACC}${C_BLD}Output${C_RST}
+  -v, --verbose             explain every decision
+  -q, --quiet               print errors only
+      --progress            progress bar
+      --banner              print the banner and exit
+      --no-banner           do not print the banner at the start of a run
+      --no-color            no colors (NO_COLOR is honoured too)
+      --json FILE           write a JSON report
+  -l, --log FILE            log file (default: $DEF_LOG)
+  -C, --config FILE         read settings from FILE
+      --no-config           ignore the default config files
+  -V, --version             print the version
+  -h, --help                this text
+
+${C_ACC}${C_BLD}Exit status${C_RST}
+  0 ok    1 finished with errors    2 bad usage    130 interrupted
+
+${C_ACC}${C_BLD}Examples${C_RST}
+  $PROG -d ~/projects               preview, change nothing
+  $PROG -t ~/projects               clean, keep an undo record
+  $PROG --undo                      ...and take it back
+  $PROG -y -q --min-age 14 /srv/uploads --json /var/log/dirsweep.json
+
+Config: ~/.config/dirsweep/config (see examples/dirsweep.conf)
+EOF
+}
+
+# --------------------------------------------------------------- safety bits
+
+is_dangerous() {
+    local p=$1 d
+    for d in "${DANGEROUS_EXACT[@]}"; do [[ $p == "$d" ]] && return 0; done
+    for d in "${DANGEROUS_TREES[@]}"; do [[ $p == "$d" || $p == "$d"/* ]] && return 0; done
+    return 1
+}
+
+build_patterns() {
+    local p
+    ALL_JUNK=()
+    $USE_DEFAULT_JUNK && ALL_JUNK+=("${JUNK_DEFAULT[@]}")
+    for p in "${JUNK_EXTRA[@]}"; do
+        # a pattern made only of wildcards would classify everything as junk
+        [[ $p =~ ^[*?.]+$ ]] && die "refusing junk pattern '$p': it would match every file" 2
+        ALL_JUNK+=("$p")
+    done
+}
+
+is_junk_name() {
+    local name=$1 p
+    for p in "${ALL_JUNK[@]}"; do
+        # shellcheck disable=SC2053  # glob match is the point
+        [[ $name == $p ]] && return 0
+    done
+    return 1
+}
+
+# Files the run itself depends on are never treated as junk.
+is_protected_file() {
+    local f=$1
+    [[ $f == "$LOG_FILE" || $f == "$JSON_OUT" || $f == "$LOCK_FILE" ]] && return 0
+    [[ -n $TRASH_DIR && ( $f == "$TRASH_DIR" || $f == "$TRASH_DIR"/* ) ]] && return 0
+    return 1
+}
+
+# Exclude regexes are tried against the path relative to the root and against
+# each of its parents, so -e '^cache$' protects everything below cache/.
+is_excluded() {
+    local cand=$1 ex
+    (( ${#EXCLUDES[@]} )) || return 1
+    while :; do
+        for ex in "${EXCLUDES[@]}"; do
+            [[ $cand =~ $ex ]] && return 0
+        done
+        [[ $cand == */* ]] || break
+        cand=${cand%/*}
+    done
+    return 1
+}
+
+# --------------------------------------------------------------- inspection
+
+list_entries() {
+    local dir=$1 e had_ng=0 had_dg=0
+    ENTRIES=()
+    shopt -q nullglob && had_ng=1
+    shopt -q dotglob && had_dg=1
+    shopt -s nullglob dotglob
+    local all=("$dir"/*)
+    (( had_ng )) || shopt -u nullglob
+    (( had_dg )) || shopt -u dotglob
+    if $DRY_RUN; then
+        for e in "${all[@]}"; do [[ -z ${GONE["$e"]+x} ]] && ENTRIES+=("$e"); done
+    else
+        ENTRIES=("${all[@]}")
+    fi
+}
+
+# Sets CLASS to empty | junk | content, and JUNK_FILES for the junk case.
+classify_dir() {
+    local e
+    JUNK_FILES=()
+    list_entries "$1"
+    if (( ${#ENTRIES[@]} == 0 )); then CLASS=empty; return; fi
+    if $STRICT; then CLASS=content; return; fi
+    for e in "${ENTRIES[@]}"; do
+        if [[ -d $e && ! -L $e ]] || [[ ! -L $e && ! -f $e ]]; then CLASS=content; return; fi
+        if is_junk_name "${e##*/}" && ! is_protected_file "$e"; then
+            JUNK_FILES+=("$e")
+        else
+            CLASS=content; return
+        fi
+    done
+    CLASS=junk
+}
+
+skip() {
+    SKIPPED=$((SKIPPED + 1))
+    SKIP_WHY[$1]=$(( ${SKIP_WHY[$1]:-0} + 1 ))
+    vmsg "skipped ($1): $2"
+}
+
+# -------------------------------------------------------------------- trash
+
+init_trash() {
+    $TRASH || return 0
+    if [[ -z $TRASH_DIR ]]; then
+        local stamp; printf -v stamp '%(%Y%m%d-%H%M%S)T' -1
+        TRASH_DIR="$DEF_TRASH_ROOT/$stamp-$$"
+    fi
+    TRASH_DIR=$(abspath "$TRASH_DIR")
+    $DRY_RUN && return 0
+    mkdir -p -- "$TRASH_DIR/files" 2>/dev/null || die "cannot create trash directory: $TRASH_DIR"
+    chmod 700 -- "$TRASH_DIR" 2>/dev/null || true
+    {
+        printf 'dirsweep %s\ncreated %s\nroots  %s\n' "$VERSION" "$(date -Iseconds)" "${ROOTS[*]}"
+    } >"$TRASH_DIR/INFO" 2>/dev/null
+}
+
+# Record format: KIND TAB mode TAB uid TAB gid TAB mtime TAB path NUL
+record() {
+    $TRASH || return 0
+    printf '%s\t%s\t%s\0' "$1" "$2" "$3" >>"$TRASH_DIR/manifest"
+}
+
+restore_session() {
+    local session=$1 i n=0 nf=0 fails=0 p src rec rest
+    local -a kinds=() modes=() uids=() gids=() mts=() paths=()
+    [[ -f $session/manifest ]] || die "not a dirsweep trash session: $session" 2
+    [[ -e $session/RESTORED ]] && warn "this session was restored before; restoring whatever is still missing"
+
+    while IFS= read -r -d '' rec; do
+        kinds+=("${rec%%$'\t'*}");    rest=${rec#*$'\t'}
+        modes+=("${rest%%$'\t'*}");   rest=${rest#*$'\t'}
+        uids+=("${rest%%$'\t'*}");    rest=${rest#*$'\t'}
+        gids+=("${rest%%$'\t'*}");    rest=${rest#*$'\t'}
+        mts+=("${rest%%$'\t'*}");     paths+=("${rest#*$'\t'}")
+    done <"$session/manifest"
+
+    info "restoring from $session"
+    # Directories were recorded children-first; walk backwards so parents exist.
+    for (( i = ${#kinds[@]} - 1; i >= 0; i-- )); do
+        [[ ${kinds[i]} == D ]] || continue
+        p=${paths[i]}
+        if [[ -d $p ]]; then vmsg "already there: $p"; continue; fi
+        if [[ -e $p || -L $p ]]; then warn "something else is at $p, not restoring it"; fails=$((fails + 1)); continue; fi
+        if $DRY_RUN; then say "would restore $p"; continue; fi
+        if mkdir -p -- "$p" 2>/dev/null; then MADE["$p"]=1; n=$((n + 1)); ok "restored $p"
+        else err "could not recreate $p"; fails=$((fails + 1)); fi
+    done
+    for (( i = 0; i < ${#kinds[@]}; i++ )); do
+        [[ ${kinds[i]} == F ]] || continue
+        p=${paths[i]} src="$session/files/${paths[i]#/}"
+        [[ -e $src || -L $src ]] || continue
+        if [[ -e $p || -L $p ]]; then warn "exists, leaving it in trash: $p"; fails=$((fails + 1)); continue; fi
+        if $DRY_RUN; then say "would restore $p"; continue; fi
+        mkdir -p -- "${p%/*}" 2>/dev/null
+        if mv -- "$src" "$p" 2>/dev/null; then nf=$((nf + 1)); vmsg "restored file $p"
+        else err "could not restore $p"; fails=$((fails + 1)); fi
+    done
+    # Permissions and times last, after children stopped changing their parents.
+    if ! $DRY_RUN; then
+        for (( i = 0; i < ${#kinds[@]}; i++ )); do
+            [[ ${kinds[i]} == D && -n ${MADE["${paths[i]}"]+x} ]] || continue
+            p=${paths[i]}
+            chown "${uids[i]}:${gids[i]}" -- "$p" 2>/dev/null
+            chmod "${modes[i]}" -- "$p" 2>/dev/null
+            touch -d "@${mts[i]}" -- "$p" 2>/dev/null
+        done
+        date -Iseconds >"$session/RESTORED" 2>/dev/null
+    fi
+    info "restored $n directories and $nf junk files"
+    (( fails == 0 )) || { warn "$fails item(s) could not be restored"; exit 1; }
+    exit 0
+}
+
+latest_session() {
+    local d last=""
+    for d in "$DEF_TRASH_ROOT"/*/; do
+        [[ -f ${d}manifest && ! -e ${d}RESTORED ]] && last=${d%/}
+    done
+    [[ -n $last ]] || return 1
+    printf '%s' "$last"
+}
+
+# ------------------------------------------------------------ run lifecycle
+
+acquire_lock() {
+    $DRY_RUN && return 0
+    local old
+    if [[ -e $LOCK_FILE ]]; then
+        old=$(cat -- "$LOCK_FILE" 2>/dev/null)
+        if [[ $old =~ ^[0-9]+$ ]] && kill -0 "$old" 2>/dev/null; then
+            die "another $PROG is running (pid $old)"
+        fi
+        rm -f -- "$LOCK_FILE" 2>/dev/null
+    fi
+    if ( set -o noclobber; printf '%d\n' "$$" >"$LOCK_FILE" ) 2>/dev/null; then
+        HAVE_LOCK=true
+    else
+        warn "could not create $LOCK_FILE, continuing without a lock"
+    fi
+}
+
+cleanup() {
+    $HAVE_LOCK && rm -f -- "$LOCK_FILE" 2>/dev/null
+    [[ $TMP_DIR == /*dirsweep.* && -d $TMP_DIR ]] && rm -rf -- "$TMP_DIR"
+    return 0
+}
+
+on_signal() {
+    trap - INT TERM HUP
+    PROGRESS_ON=false; echo >&2
+    warn "interrupted"
+    finish_run
+    exit 130
+}
+
+init_log() {
+    if $DRY_RUN && ! $LOG_EXPLICIT; then LOG_FILE=""; return 0; fi
+    [[ -n $LOG_FILE ]] || LOG_FILE=$DEF_LOG
+    LOG_FILE=$(abspath "$LOG_FILE")
+    mkdir -p -- "${LOG_FILE%/*}" 2>/dev/null
+    if ! { : >>"$LOG_FILE"; } 2>/dev/null; then
+        local fb="${TMPDIR:-/tmp}/dirsweep-$EUID.log"
+        warn "cannot write $LOG_FILE, logging to $fb instead"
+        LOG_FILE=$fb
+        { : >>"$LOG_FILE"; } 2>/dev/null || { LOG_FILE=""; warn "logging disabled"; }
+    fi
+}
+
+prepare_roots() {
+    local r a seen=" "
+    local -a given=("${CLI_ROOTS[@]}")
+    (( ${#given[@]} )) || given=("${CFG_ROOTS[@]}")
+    (( ${#given[@]} )) || given=(.)
+    ROOTS=()
+    for r in "${given[@]}"; do
+        a=$(abspath "$r")
+        [[ -d $a ]] || die "not a directory: $r" 2
+        is_dangerous "$a" && die "refusing to scan protected path: $a" 2
+        [[ $seen == *" $a "* ]] && continue
+        seen+="$a "
+        ROOTS+=("$a")
+    done
+}
+
+check_trash_location() {
+    local r
+    [[ -n $TRASH_DIR ]] || return 0
+    for r in "${ROOTS[@]}"; do
+        [[ $TRASH_DIR == "$r" || $TRASH_DIR == "$r"/* ]] && \
+            die "the trash directory ($TRASH_DIR) is inside the target ($r); pick another with -T" 2
+    done
+    return 0
+}
+
+ask() {
+    local ans
+    $ALL_YES && return 0
+    _clearline
+    read -r -p "$1 [y/N/a/q] " ans </dev/tty || { QUIT=true; return 1; }
+    case ${ans,,} in
+        y|yes) return 0 ;;
+        a|all) ALL_YES=true; return 0 ;;
+        q|quit) QUIT=true; return 1 ;;
+        *) return 1 ;;
+    esac
+}
+
+print_plan() {
+    local r mode
+    if $DRY_RUN; then mode="${C_YEL}dry run${C_RST} (nothing will change)"
+    elif $TRASH; then mode="remove, undo record in $TRASH_DIR"
+    else mode="${C_RED}remove permanently${C_RST}"; fi
+    if banner_wanted; then
+        print_banner
+    else
+        say "${C_ACC}${C_BLD}$PROG $VERSION${C_RST}"
+    fi
+    for r in "${ROOTS[@]}"; do say "  target   $r"; done
+    say "  mode     $mode"
+    (( MIN_AGE_SECS > 0 )) && say "  min age  $((MIN_AGE_SECS / 3600))h"
+    (( ${#EXCLUDES[@]} )) && say "  exclude  ${EXCLUDES[*]}"
+    $STRICT && say "  strict   only truly empty directories"
+    say ""
+}
+
+confirm_run() {
+    local ans
+    $DRY_RUN && return 0
+    $ASSUME_YES && return 0
+    if $QUIET; then die "refusing to delete silently without --yes" 2; fi
+    [[ -t 0 ]] || die "not a terminal, and no --yes given; refusing to delete" 2
+    read -r -p "  Proceed? [y/N] " ans
+    [[ ${ans,,} == y || ${ans,,} == yes ]] || { say "  cancelled."; exit 0; }
+    say ""
+}
+
+# ------------------------------------------------------------------ actions
+
+remove_junk() {
+    local f=$1 meta rel
+    if $DRY_RUN; then
+        GONE["$f"]=1; JUNK_N=$((JUNK_N + 1)); vmsg "would remove junk: $f"
+    else
+        if $TRASH; then
+            meta=$(stat --printf='%a\t%u\t%g\t%Y' -- "$f" 2>/dev/null)
+            rel="$TRASH_DIR/files/${f#/}"
+            mkdir -p -- "${rel%/*}" 2>/dev/null
+            if mv -- "$f" "$rel" 2>/dev/null; then
+                record F "$meta" "$f"
+            else
+                ERRORS=$((ERRORS + 1)); warn "could not move junk to trash: $f"; return 1
+            fi
+        elif ! rm -f -- "$f" 2>/dev/null; then
+            ERRORS=$((ERRORS + 1)); warn "could not remove junk: $f"; log ERROR "junk: $f"; return 1
+        fi
+        JUNK_N=$((JUNK_N + 1)); vmsg "removed junk: $f"; log INFO "junk removed: $f"
+    fi
+    [[ -n $JSON_OUT ]] && { json_escape "$f"; printf '"%s"\n' "$REPLY" >>"$TMP_DIR/junk.json"; }
+    return 0
+}
+
+remove_dir() {
+    local dir=$1 meta=$2
+    if $DRY_RUN; then
+        GONE["$dir"]=1; REMOVED=$((REMOVED + 1))
+        say "${C_YEL}would remove${C_RST} $dir"
+    else
+        if ! rmdir -- "$dir" 2>/dev/null; then
+            ERRORS=$((ERRORS + 1)); warn "could not remove: $dir"; log ERROR "rmdir failed: $dir"
+            return 1
+        fi
+        record D "$meta" "$dir"
+        REMOVED=$((REMOVED + 1)); ok "removed $dir"; log INFO "removed: $dir"
+    fi
+    [[ -n $JSON_OUT ]] && { json_escape "$dir"; printf '"%s"\n' "$REPLY" >>"$TMP_DIR/dirs.json"; }
+    return 0
+}
+
+process_dir() {
+    local dir=$1 mtime=$2 root=$3 rel parent f meta
+    local -a devs
+    [[ -L $dir ]] && { CHECKED=$((CHECKED + 1)); skip symlink "$dir"; return; }
+    [[ -d $dir ]] || return 0
+    CHECKED=$((CHECKED + 1))
+    rel=${dir#"$root"/}
+
+    is_dangerous "$dir"   && { skip protected "$dir"; return; }
+    is_excluded "$rel"    && { skip excluded "$rel"; return; }
+    if (( MIN_AGE_SECS > 0 && NOW - mtime < MIN_AGE_SECS )); then skip recent "$rel"; return; fi
+
+    classify_dir "$dir"
+    if [[ $CLASS == content ]]; then
+        KEPT=$((KEPT + 1)); vmsg "kept (has content): $rel"; return
+    fi
+
+    parent=${dir%/*}; [[ -n $parent ]] || parent=/
+    if [[ ! -w $parent || ! -w $dir || ! -x $dir ]]; then skip "no permission" "$rel"; return; fi
+    mapfile -t devs < <(stat -c %d -- "$dir" "$parent" 2>/dev/null)
+    if [[ ${devs[0]:-a} != "${devs[1]:-b}" ]]; then skip "mount point" "$rel"; return; fi
+
+    if $INTERACTIVE && ! $DRY_RUN; then
+        local what="remove '$rel'"
+        [[ $CLASS == junk ]] && what+=" (and ${#JUNK_FILES[@]} junk file(s))"
+        ask "  $what?" || { skip declined "$rel"; return; }
+    fi
+
+    meta=$(stat --printf='%a\t%u\t%g\t%Y' -- "$dir" 2>/dev/null)
+    if [[ $CLASS == junk ]]; then
+        for f in "${JUNK_FILES[@]}"; do
+            remove_junk "$f" || { skip "junk not removable" "$rel"; return; }
+        done
+    fi
+    remove_dir "$dir" "$meta"
+}
+
+draw_progress() {
+    $PROGRESS_ON || return 0
+    local cur=$1 tot=$2 w=40 pct filled bar pad
+    (( tot > 0 )) || return 0
+    pct=$(( cur * 100 / tot ))
+    (( pct == LAST_PCT && cur != tot )) && return 0
+    LAST_PCT=$pct
+    filled=$(( cur * w / tot ))
+    printf -v bar '%*s' "$filled" ''; bar=${bar// /█}
+    printf -v pad '%*s' "$((w - filled))" ''; pad=${pad// /░}
+    printf '\r  %s[%s%s]%s %3d%% (%d/%d)' "$C_CYN" "$bar" "$pad" "$C_RST" "$pct" "$cur" "$tot" >&2
+}
+
+scan_root() {
+    local root=$1 snap="$TMP_DIR/snap" errs="$TMP_DIR/find.err"
+    local -a fargs=()
+    local total rec mt dir n=0
+    $FOLLOW_LINKS && fargs+=(-L)
+    fargs+=("$root")
+    $CROSS_FS || fargs+=(-xdev)
+    fargs+=(-mindepth 1)
+    (( MAX_DEPTH > 0 )) && fargs+=(-maxdepth "$MAX_DEPTH")
+    # -depth: children come before their parents, so chains collapse in one pass.
+    fargs+=(-depth -type d -printf '%T@\t%p\0')
+
+    # The snapshot is taken up front: modification times are read before we
+    # start deleting (removing a child would otherwise make its parent look new).
+    find "${fargs[@]}" >"$snap" 2>"$errs"
+    if [[ -s $errs ]]; then
+        warn "find reported $(wc -l <"$errs") problem(s) under $root (see log)"
+        while IFS= read -r rec; do log FIND "$rec"; done <"$errs"
+    fi
+    total=$(tr -cd '\0' <"$snap" | wc -c)
+    $PROGRESS && [[ -t 2 ]] && ! $QUIET && PROGRESS_ON=true
+    log INFO "scan $root ($total directories)"
+
+    exec 3<"$snap"
+    while IFS= read -r -d '' -u 3 rec; do
+        mt=${rec%%$'\t'*}; dir=${rec#*$'\t'}
+        process_dir "$dir" "${mt%%.*}" "$root"
+        n=$((n + 1)); draw_progress "$n" "$total"
+        $QUIT && break
+    done
+    exec 3<&-
+    if $PROGRESS_ON; then printf '\r\033[K' >&2; PROGRESS_ON=false; fi
+}
+
+write_json() {
+    [[ -n $JSON_OUT ]] || return 0
+    local k first=true dirs="" junk="" why=""
+    [[ -s $TMP_DIR/dirs.json ]] && dirs=$(paste -sd, "$TMP_DIR/dirs.json")
+    [[ -s $TMP_DIR/junk.json ]] && junk=$(paste -sd, "$TMP_DIR/junk.json")
+    for k in "${!SKIP_WHY[@]}"; do
+        $first || why+=","
+        first=false
+        json_escape "$k"; why+="\"$REPLY\":${SKIP_WHY[$k]}"
+    done
+    {
+        printf '{\n  "tool": "%s",\n  "version": "%s",\n' "$PROG" "$VERSION"
+        printf '  "timestamp": "%s",\n  "dry_run": %s,\n' "$(date -Iseconds)" "$DRY_RUN"
+        printf '  "roots": %s,\n  "duration_seconds": %d,\n' "$(json_array "${ROOTS[@]}")" "$SECONDS"
+        printf '  "stats": {"checked": %d, "removed_dirs": %d, "removed_junk_files": %d, "kept": %d, "skipped": %d, "errors": %d},\n' \
+            "$CHECKED" "$REMOVED" "$JUNK_N" "$KEPT" "$SKIPPED" "$ERRORS"
+        printf '  "skipped_by_reason": {%s},\n' "$why"
+        printf '  "options": {"strict": %s, "min_age_seconds": %d, "max_depth": %d, "cross_filesystems": %s, "follow_symlinks": %s, "trash": %s,\n' \
+            "$STRICT" "$MIN_AGE_SECS" "$MAX_DEPTH" "$CROSS_FS" "$FOLLOW_LINKS" "$TRASH"
+        printf '    "exclude": %s, "junk_extra": %s},\n' "$(json_array "${EXCLUDES[@]}")" "$(json_array "${JUNK_EXTRA[@]}")"
+        if $TRASH && ! $DRY_RUN; then json_escape "$TRASH_DIR"; printf '  "trash_dir": "%s",\n' "$REPLY"; else printf '  "trash_dir": null,\n'; fi
+        printf '  "removed_dirs": [%s],\n  "removed_junk_files": [%s]\n}\n' "$dirs" "$junk"
+    } >"$JSON_OUT" 2>/dev/null || { warn "could not write $JSON_OUT"; return 0; }
+    info "report written to $JSON_OUT"
+}
+
+finish_run() {
+    $FINISHED && return 0
+    FINISHED=true
+    write_json
+    log INFO "done: removed=$REMOVED junk=$JUNK_N kept=$KEPT skipped=$SKIPPED errors=$ERRORS"
+    if $QUIET; then
+        (( ERRORS > 0 )) && warn "$ERRORS error(s), see ${LOG_FILE:-the log}"
+        return 0
+    fi
+    local label="Removed" w="" dur=$SECONDS
+    $DRY_RUN && label="Would remove"
+    printf '%s\n' "${C_DIM}────────────────────────────────────────${C_RST}"
+    printf '  %-22s %d\n' "Directories scanned" "$CHECKED"
+    printf '  %-22s %s%d%s\n' "$label" "$C_GRN" "$REMOVED" "$C_RST"
+    printf '  %-22s %d\n' "Junk files" "$JUNK_N"
+    printf '  %-22s %d\n' "Kept (has content)" "$KEPT"
+    printf '  %-22s %d' "Skipped" "$SKIPPED"
+    if (( SKIPPED > 0 )); then
+        local k parts=()
+        for k in "${!SKIP_WHY[@]}"; do parts+=("${SKIP_WHY[$k]} $k"); done
+        w=" ($(IFS=,; printf '%s' "${parts[*]}" | sed 's/,/, /g'))"
+    fi
+    printf '%s%s%s\n' "$C_DIM" "$w" "$C_RST"
+    (( ERRORS > 0 )) && printf '  %-22s %s%d%s\n' "Errors" "$C_RED" "$ERRORS" "$C_RST"
+    printf '  %-22s %ds\n' "Time" "$dur"
+    $DRY_RUN || { [[ -n $LOG_FILE ]] && printf '  %s%-22s %s%s\n' "$C_DIM" "Log" "$LOG_FILE" "$C_RST"; }
+    $TRASH && ! $DRY_RUN && (( REMOVED + JUNK_N > 0 )) && \
+        printf '  %s%-22s %s%s\n' "$C_DIM" "Undo with" "$PROG --restore $TRASH_DIR" "$C_RST"
+    $DRY_RUN && printf '\n  %sdry run: nothing was changed%s\n' "$C_YEL" "$C_RST"
+    return 0
+}
+
+# --------------------------------------------------------------------- main
+
+main() {
+    local cfg e r
+    trap cleanup EXIT
+    trap on_signal INT TERM HUP
+    normalize_args "$@"
+    prescan_args
+    setup_colors
+
+    if $USE_CONFIG; then
+        [[ -r /etc/dirsweep.conf ]] && load_config /etc/dirsweep.conf
+        cfg="${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}/dirsweep/config"
+        [[ -r $cfg ]] && load_config "$cfg"
+    fi
+    [[ -n $CONFIG_FILE ]] && load_config "$CONFIG_FILE"
+    parse_args "${NORM[@]}"
+    setup_colors
+    build_patterns
+
+    for e in "${EXCLUDES[@]}"; do
+        [[ "" =~ $e ]]; (( $? == 2 )) && die "invalid --exclude regex: $e" 2
+    done
+
+    if $SHOW_BANNER_ONLY; then print_banner; exit 0; fi
+
+    if $LIST_JUNK; then
+        printf '%s\n' "${ALL_JUNK[@]}"
+        exit 0
+    fi
+
+    if [[ -n $RESTORE_FROM || $DO_UNDO == true ]]; then
+        if $DO_UNDO; then
+            RESTORE_FROM=$(latest_session) || die "no undoable trash session found in $DEF_TRASH_ROOT" 1
+        fi
+        restore_session "$(abspath "$RESTORE_FROM")"
+    fi
+
+    if $INTERACTIVE && ! $DRY_RUN; then
+        { : </dev/tty; } 2>/dev/null || die "--interactive needs a terminal" 2
+    fi
+
+    for e in find rmdir rm mv stat realpath mktemp paste; do
+        command -v "$e" >/dev/null 2>&1 || die "required tool not found: $e" 2
+    done
+    find --version 2>&1 | grep -q 'GNU findutils' || die "GNU find is required" 2
+
+    prepare_roots
+    init_trash
+    check_trash_location
+    init_log
+    TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/dirsweep.XXXXXX") || die "cannot create a temp directory"
+    [[ -n $JSON_OUT ]] && JSON_OUT=$(abspath "$JSON_OUT")
+    LOCK_FILE=$(abspath "$LOCK_FILE")
+    printf -v NOW '%(%s)T' -1
+
+    print_plan
+    confirm_run
+    acquire_lock
+    log INFO "start roots=${ROOTS[*]} dry_run=$DRY_RUN trash=$TRASH min_age=${MIN_AGE_SECS}s strict=$STRICT"
+
+    for r in "${ROOTS[@]}"; do
+        $QUIT && break
+        scan_root "$r"
+    done
+
+    finish_run
+    (( ERRORS == 0 )) || exit 1
+    exit 0
+}
+
+main "$@"

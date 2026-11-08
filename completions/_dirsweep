@@ -1,0 +1,34 @@
+#compdef dirsweep
+
+_arguments -s \
+  '*'{-p,--path}'[directory to clean]:directory:_files -/' \
+  '(-m --max-depth)'{-n,--no-subdirs}'[only direct children of the target]' \
+  '(-n --no-subdirs)'{-m,--max-depth}'[look at most N levels deep]:levels' \
+  '(-s --strict-empty)'{-s,--strict-empty}'[remove only truly empty directories]' \
+  '*'{-e,--exclude}'[skip paths matching this regex]:regex' \
+  '*'{-j,--junk}'[extra junk file pattern]:glob' \
+  '--no-default-junk[use only the patterns given with -j]' \
+  '--list-junk[show junk patterns and exit]' \
+  '--min-age[only touch directories unchanged for AGE]:age (30, 12h, 2w)' \
+  '(-x --cross-filesystems)'{-x,--cross-filesystems}'[descend into other filesystems]' \
+  '(-f --follow-symlinks)'{-f,--follow-symlinks}'[traverse symlinked directories]' \
+  '(-d --dry-run)'{-d,--dry-run}'[show what would happen]' \
+  '(-i --interactive)'{-i,--interactive}'[ask before each removal]' \
+  '(-y --yes)'{-y,--yes}'[skip the global confirmation]' \
+  '(-t --trash)'{-t,--trash}'[keep an undo record]' \
+  '(-T --trash-dir)'{-T,--trash-dir}'[keep the undo record in DIR]:directory:_files -/' \
+  '--undo[undo the most recent --trash run]' \
+  '--restore[undo a specific trash session]:session:_files -/' \
+  '(-v --verbose)'{-v,--verbose}'[explain every decision]' \
+  '(-q --quiet)'{-q,--quiet}'[print errors only]' \
+  '--progress[progress bar]' \
+  '--banner[print the banner and exit]' \
+  '--no-banner[no banner at the start of a run]' \
+  '--no-color[disable colors]' \
+  '--json[write a JSON report]:file:_files' \
+  '(-l --log)'{-l,--log}'[log file]:file:_files' \
+  '(-C --config)'{-C,--config}'[read settings from FILE]:file:_files' \
+  '--no-config[ignore the default config files]' \
+  '(-V --version)'{-V,--version}'[print the version]' \
+  '(-h --help)'{-h,--help}'[show help]' \
+  '*:directory:_files -/'

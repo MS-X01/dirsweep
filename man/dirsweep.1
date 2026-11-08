@@ -1,0 +1,138 @@
+.TH DIRSWEEP 1 "November 2026" "dirsweep 4.0.0" "User Commands"
+.SH NAME
+dirsweep \- remove empty and junk-only directories, with an undo
+.SH SYNOPSIS
+.B dirsweep
+[\fIoptions\fR] [\fIPATH\fR...]
+.br
+.B dirsweep \-\-undo
+.br
+.B dirsweep \-\-restore
+\fISESSION\fR
+.SH DESCRIPTION
+.B dirsweep
+walks one or more directory trees and removes directories that are empty, or
+that contain nothing but junk files (\fI.DS_Store\fR, \fIThumbs.db\fR, editor
+swap and backup files, \fI*.log\fR, \fI*.tmp\fR and similar).
+Chains of nested empty directories are removed in a single pass.
+A directory that holds even one real file is left alone, junk included.
+The target directory itself is never removed.
+.PP
+Symlinks are never followed (unless \fB\-\-follow\-symlinks\fR) and never
+removed as directories. Other filesystems are not entered unless
+\fB\-\-cross\-filesystems\fR is given.
+.SH SELECTION
+.TP
+.BR \-p ", " \-\-path " " \fIPATH\fR
+Directory to clean. May be repeated; bare arguments are treated the same way.
+Defaults to the current directory.
+.TP
+.BR \-n ", " \-\-no\-subdirs
+Only consider direct children of the target.
+.TP
+.BR \-m ", " \-\-max\-depth " " \fIN\fR
+Consider at most N levels (0 = unlimited).
+.TP
+.BR \-s ", " \-\-strict\-empty
+Remove only directories that are really empty; junk files count as content.
+.TP
+.BR \-e ", " \-\-exclude " " \fIREGEX\fR
+Extended regular expression. A directory is skipped if its path relative to the
+target, or any parent of that path, matches. Repeatable; commas separate
+several patterns.
+.TP
+.BR \-j ", " \-\-junk " " \fIGLOB\fR
+Additional junk file pattern. Patterns made only of wildcards are refused.
+.TP
+.B \-\-no\-default\-junk
+Use only patterns given with \fB\-j\fR.
+.TP
+.B \-\-list\-junk
+Print the junk patterns in effect and exit.
+.TP
+.B \-\-min\-age \fIAGE\fR
+Only touch directories whose modification time is at least AGE old. A bare
+number means days; suffixes s, m, h, d, w are accepted.
+Times are read before anything is deleted.
+.SH SAFETY
+.TP
+.BR \-d ", " \-\-dry\-run
+Report what would happen. The report matches a real run.
+.TP
+.BR \-i ", " \-\-interactive
+Ask before every removal: y, N, a (all), q (quit). Needs a terminal.
+.TP
+.BR \-y ", " \-\-yes
+Skip the global confirmation. Without a terminal, dirsweep refuses to delete
+unless this is given.
+.TP
+.BR \-t ", " \-\-trash
+Record every removal so it can be undone. The record lives under
+\fI$XDG_DATA_HOME/dirsweep/trash\fR (\fI/var/lib/dirsweep/trash\fR for root).
+.TP
+.BR \-T ", " \-\-trash\-dir " " \fIDIR\fR
+Like \fB\-\-trash\fR but keep the record in DIR, which must not be inside a target.
+.TP
+.B \-\-undo
+Undo the most recent trash session.
+.TP
+.B \-\-restore \fISESSION\fR
+Undo a specific session. Directories are recreated with their original mode,
+owner (when permitted) and mtime; junk files are moved back. Nothing that
+exists now is overwritten.
+.SH OUTPUT
+.TP
+.BR \-v ", " \-\-verbose
+Explain every decision.
+.TP
+.BR \-q ", " \-\-quiet
+Print errors only.
+.TP
+.B \-\-progress
+Show a progress bar on stderr.
+.TP
+.B \-\-json \fIFILE\fR
+Write a JSON report (statistics, options, removed directories and files).
+.TP
+.BR \-l ", " \-\-log " " \fIFILE\fR
+Log file.
+.TP
+.B \-\-banner
+Print the banner and exit.
+.TP
+.B \-\-no\-banner
+Do not print the banner at the start of a run. It is only shown on a terminal
+in the first place.
+.TP
+.B \-\-no\-color
+Disable colors. \fBNO_COLOR\fR is honoured.
+.SH CONFIGURATION
+Settings are read from \fI/etc/dirsweep.conf\fR, then
+\fI$XDG_CONFIG_HOME/dirsweep/config\fR (default \fI~/.config/dirsweep/config\fR),
+then \fB\-C\fR \fIFILE\fR, then the command line. Files contain
+\fIkey = value\fR lines and are never executed. See
+\fI/usr/share/doc/dirsweep/examples\fR or the source repository for a sample.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Finished, but some removals failed (or nothing to undo).
+.TP
+.B 2
+Usage error or refusal (protected path, no confirmation, bad option).
+.TP
+.B 130
+Interrupted.
+.SH FILES
+.TP
+.I ~/.local/state/dirsweep/dirsweep.log
+Default log (\fI/var/log/dirsweep.log\fR for root).
+.SH LIMITATIONS
+An empty directory that is the target of a symlink elsewhere is still removed,
+leaving the link dangling. Paths with control characters other than newline,
+carriage return and tab are not escaped in the JSON report. Linux with GNU
+findutils and coreutils only.
+.SH AUTHOR
+Mohammad Sadra Naderi (ZVitoX), https://github.com/MS-X01

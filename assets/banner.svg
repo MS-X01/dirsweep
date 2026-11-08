@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" width="100%" role="img" aria-label="dirsweep: remove empty and junk-only directories, with an undo">
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0f1013"/><stop offset="1" stop-color="#21140b"/></linearGradient>
+  <linearGradient id="ac" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#ff6a00"/><stop offset="1" stop-color="#ffc34d"/></linearGradient>
+  <clipPath id="c"><rect width="1200" height="300" rx="14"/></clipPath>
+</defs>
+<style>
+  text{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace;white-space:pre}
+  .t{font-size:78px;font-weight:700;fill:url(#ac)}
+  .s{font-size:20px;fill:#a89d93}
+  .k{font-size:15px;fill:#7d746c}
+  .tree{font-size:19px;fill:#e8e1da}
+  .note{fill:#7d746c}
+  .real{fill:#e8e1da}
+  .cur{animation:blink 1s steps(1) infinite}
+  @keyframes blink{50%{opacity:0}}
+  .sweep{animation:sw 7s ease-in-out infinite}
+  @keyframes sw{0%{transform:translateX(-120px);opacity:0}10%{opacity:.9}55%{transform:translateX(560px);opacity:.9}62%,100%{transform:translateX(560px);opacity:0}}
+  .g1{animation:gone 7s infinite}.g2{animation:gone2 7s infinite}.g3{animation:gone3 7s infinite}
+  @keyframes gone{0%,18%{opacity:1}30%,92%{opacity:0}100%{opacity:1}}
+  @keyframes gone2{0%,26%{opacity:1}38%,92%{opacity:0}100%{opacity:1}}
+  @keyframes gone3{0%,34%{opacity:1}46%,92%{opacity:0}100%{opacity:1}}
+</style>
+<g clip-path="url(#c)">
+  <rect width="1200" height="300" fill="url(#bg)"/>
+  <g opacity=".06" stroke="#ff8a1f"><path d="M0 60H1200M0 120H1200M0 180H1200M0 240H1200"/></g>
+
+  <text xml:space="preserve" class="t" x="60" y="140">dirsweep</text>
+  <rect x="62" y="158" width="150" height="4" rx="2" fill="url(#ac)"/>
+  <text xml:space="preserve" class="s" x="62" y="200">Remove empty and junk-only directories.</text>
+  <text xml:space="preserve" class="s" x="62" y="228">Dry runs that match reality. Undo included.</text>
+  <text xml:space="preserve" class="k" x="62" y="268">bash  ·  one file  ·  no dependencies<tspan class="cur" fill="#ff8a1f">  ▍</tspan></text>
+
+  <g transform="translate(700 74)" fill="none" stroke="#5a4d42" stroke-width="2" stroke-linecap="round">
+    <text xml:space="preserve" class="tree" x="0" y="0" stroke="none">projects/</text>
+    <g><path d="M10 10V21M10 21H28"/><text xml:space="preserve" class="tree real" x="38" y="27" stroke="none">src/</text></g>
+    <g><path d="M10 21V48M10 48H28"/><text xml:space="preserve" class="tree real" x="38" y="54" stroke="none">notes.md</text></g>
+    <g class="g1"><path d="M10 48V75M10 75H28"/><text xml:space="preserve" class="tree" x="38" y="81" stroke="none">dist/</text><text xml:space="preserve" class="tree note" x="230" y="81" stroke="none">empty</text></g>
+    <g class="g2"><path d="M44 86V102M44 102H62"/><text xml:space="preserve" class="tree" x="72" y="108" stroke="none">old/</text><text xml:space="preserve" class="tree note" x="230" y="108" stroke="none">empty</text></g>
+    <g class="g3"><path d="M10 75V129M10 129H28"/><text xml:space="preserve" class="tree" x="38" y="135" stroke="none">.cache/</text><text xml:space="preserve" class="tree note" x="230" y="135" stroke="none">only .DS_Store</text></g>
+    <rect class="sweep" x="-14" y="64" width="6" height="86" rx="3" fill="url(#ac)" stroke="none"/>
+  </g>
+</g>
+</svg>
